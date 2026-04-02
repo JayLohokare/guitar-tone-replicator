@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stem Separator - Extract Vocals, Guitar, Drums & More</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #ffffff;
+            color: #1a1a1a;
+            min-height: 100vh;
+            padding: 40px 20px;
+        }
+        
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        
+        h1 {
+            font-size: 2rem;
+            font-weight: 700;
+            margin-bottom: 8px;
+            color: #000;
+        }
+        
+        .subtitle {
+            color: #666;
+            margin-bottom: 40px;
+            font-size: 1rem;
+        }
+        
+        .card {
+            background: #fafafa;
+            border: 1px solid #e5e5e5;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 24px;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        label {
+            display: block;
+            font-weight: 500;
+            margin-bottom: 8px;
+            font-size: 0.9rem;
+            color: #333;
+        }
+        
+        input[type="text"], select {
+            width: 100%;
+            padding: 12px 16px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 1rem;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        
+        input[type="text"]:focus, select:focus {
+            outline: none;
+            border-color: #000;
+            box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.1);
+        }
+        
+        .row {
+            display: flex;
+            gap: 16px;
+        }
+        
+        .row .form-group {
+            flex: 1;
+        }
+        
+        button {
+            background: #000;
+            color: #fff;
+            border: none;
+            padding: 14px 28px;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        
+        button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+        }
+        
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+        
+        .btn-secondary {
+            background: #fff;
+            color: #000;
+            border: 1px solid #ddd;
+        }
+        
+        .btn-secondary:hover {
+            background: #f5f5f5;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        }
+        
+        .btn-small {
+            padding: 8px 16px;
+            font-size: 0.85rem;
+        }
+        
+        .btn-download {
+            background: #1a1a1a;
+        }
+        
+        .loader {
+            display: none;
+            text-align: center;
+            padding: 40px;
+        }
+        
+        .loader.active {
+            display: block;
+        }
+        
+        .spinner {
+            width: 48px;
+            height: 48px;
+            border: 4px solid #e5e5e5;
+            border-top-color: #000;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 16px;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        .loader-text {
+            color: #666;
+            font-size: 0.95rem;
+        }
+        
+        .progress {
+            margin-top: 8px;
+            font-size: 0.85rem;
+            color: #999;
+        }
+        
+        .results {
+            display: none;
+        }
+        
+        .results.active {
+            display: block;
+        }
+        
+        .track-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        
+        .track-item {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            padding: 16px;
+            background: #fff;
+            border: 1px solid #e5e5e5;
+            border-radius: 8px;
+        }
+        
+        .track-icon {
+            width: 48px;
+            height: 48px;
+            background: #f0f0f0;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+            flex-shrink: 0;
+        }
+        
+        .track-info {
+            flex: 1;
+            min-width: 0;
+        }
+        
+        .track-name {
+            font-weight: 600;
+            font-size: 1rem;
+            text-transform: capitalize;
+            margin-bottom: 4px;
+        }
+        
+        .track-size {
+            font-size: 0.85rem;
+            color: #666;
+        }
+        
+        .track-actions {
+            display: flex;
+            gap: 8px;
+            flex-shrink: 0;
+        }
+        
+        audio {
+            height: 36px;
+            width: 200px;
+        }
+        
+        .actions {
+            display: flex;
+            gap: 12px;
+            margin-top: 24px;
+        }
+        
+        .error {
+            display: none;
+            background: #fee2e2;
+            border: 1px solid #fecaca;
+            color: #dc2626;
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 24px;
+        }
+        
+        .error.active {
+            display: block;
+        }
+        
+        .status-bar {
+            font-size: 0.85rem;
+            color: #666;
+            margin-top: 16px;
+            padding: 12px;
+            background: #f5f5f5;
+            border-radius: 6px;
+        }
+        
+        .status-bar .api-status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #22c55e;
+        }
+        
+        .status-dot.offline {
+            background: #ef4444;
+        }
+        
+        .form-section {
+            display: block;
+        }
+        
+        .form-section.hidden {
+            display: none;
+        }
+        
+        @media (max-width: 600px) {
+            .row {
+                flex-direction: column;
+                gap: 0;
+            }
+            
+            audio {
+                width: 100%;
+                margin-top: 12px;
+            }
+            
+            .track-item {
+                flex-wrap: wrap;
+            }
+            
+            .track-actions {
+                width: 100%;
+                margin-top: 12px;
+                justify-content: flex-end;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎸 Stem Separator</h1>
+        <p class="subtitle">Extract vocals, guitar, drums, bass, piano & more from any song</p>
+        
+        <div class="error" id="errorBox">
+            <span id="errorText"></span>
+        </div>
+        
+        <!-- Input Form -->
+        <div class="form-section" id="formSection">
+            <div class="card">
+                <div class="form-group">
+                    <label for="apiUrl">API Server URL</label>
+                    <input type="text" id="apiUrl" placeholder="http://localhost:8766" value="http://localhost:8766">
+                </div>
+                
+                <div class="form-group">
+                    <label for="videoUrl">YouTube Video URL</label>
+                    <input type="text" id="videoUrl" placeholder="https://www.youtube.com/watch?v=..." autofocus>
+                </div>
+                
+                <div class="row">
+                    <div class="form-group">
+                        <label for="format">Output Format</label>
+                        <select id="format">
+                            <option value="ogg">OGG (Smallest, ~3MB)</option>
+                            <option value="mp3">MP3 (Good, ~6MB)</option>
+                            <option value="flac">FLAC (Lossless, ~30MB)</option>
+                            <option value="wav">WAV (Uncompressed, ~36MB)</option>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="stems">Stems to Extract</label>
+                        <select id="stems">
+                            <option value="">All Stems</option>
+                            <option value="guitar">Guitar Only</option>
+                            <option value="vocals">Vocals Only</option>
+                            <option value="drums">Drums Only</option>
+                            <option value="bass">Bass Only</option>
+                            <option value="piano">Piano Only</option>
+                            <option value="vocals,guitar">Vocals + Guitar</option>
+                            <option value="drums,bass">Drums + Bass</option>
+                        </select>
+                    </div>
+                </div>
+                
+                <button type="button" id="submitBtn" onclick="startSeparation()">
+                    Extract Stems
+                </button>
+                
+                <div class="status-bar">
+                    <div class="api-status">
+                        <div class="status-dot" id="statusDot"></div>
+                        <span id="statusText">Checking API...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Loader -->
+        <div class="loader" id="loader">
+            <div class="spinner"></div>
+            <div class="loader-text">Processing audio...</div>
+            <div class="progress" id="progressText">This may take 30-60 seconds</div>
+        </div>
+        
+        <!-- Results -->
+        <div class="results" id="results">
+            <div class="card">
+                <h2 style="font-size: 1.25rem; margin-bottom: 8px;">✅ Stems Ready</h2>
+                <p class="subtitle" style="margin-bottom: 20px;" id="resultSummary"></p>
+                
+                <div class="track-list" id="trackList"></div>
+                
+                <div class="actions">
+                    <button class="btn-secondary" onclick="downloadAll()">
+                        📥 Download All (ZIP)
+                    </button>
+                    <button class="btn-secondary" onclick="resetForm()">
+                        🔄 New Song
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let currentJobId = null;
+        let apiUrl = 'http://localhost:8766';
+        let pollInterval = null;
+        
+        // Check API status on load
+        document.addEventListener('DOMContentLoaded', () => {
+            checkApiStatus();
+        });
+        
+        async function checkApiStatus() {
+            const apiInput = document.getElementById('apiUrl');
+            const statusDot = document.getElementById('statusDot');
+            const statusText = document.getElementById('statusText');
+            
+            try {
+                const response = await fetch(apiInput.value + '/', { 
+                    method: 'GET',
+                    mode: 'cors'
+                });
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    statusDot.classList.remove('offline');
+                    statusText.textContent = `API Online • ${data.model} • ${data.optimization}`;
+                } else {
+                    throw new Error('API error');
+                }
+            } catch (e) {
+                statusDot.classList.add('offline');
+                statusText.textContent = 'API Offline - Check URL or start server';
+            }
+        }
+        
+        document.getElementById('apiUrl').addEventListener('change', checkApiStatus);
+        
+        function showError(message) {
+            const errorBox = document.getElementById('errorBox');
+            const errorText = document.getElementById('errorText');
+            errorText.textContent = message;
+            errorBox.classList.add('active');
+        }
+        
+        function hideError() {
+            document.getElementById('errorBox').classList.remove('active');
+        }
+        
+        async function startSeparation() {
+            hideError();
+            
+            const videoUrl = document.getElementById('videoUrl').value.trim();
+            const format = document.getElementById('format').value;
+            const stems = document.getElementById('stems').value;
+            apiUrl = document.getElementById('apiUrl').value.trim();
+            
+            if (!videoUrl) {
+                showError('Please enter a YouTube URL');
+                return;
+            }
+            
+            if (!apiUrl) {
+                showError('Please enter an API server URL');
+                return;
+            }
+            
+            // Show loader
+            document.getElementById('formSection').classList.add('hidden');
+            document.getElementById('loader').classList.add('active');
+            document.getElementById('results').classList.remove('active');
+            
+            try {
+                // Submit job
+                const formData = new FormData();
+                formData.append('url', videoUrl);
+                formData.append('format', format);
+                if (stems) formData.append('stems', stems);
+                
+                const response = await fetch(apiUrl + '/youtube', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Failed to start processing');
+                }
+                
+                const data = await response.json();
+                currentJobId = data.job_id;
+                
+                // Update progress text
+                document.getElementById('progressText').textContent = 
+                    `Job ID: ${currentJobId} • Downloading and separating audio...`;
+                
+                // Poll for status
+                pollStatus();
+                
+            } catch (e) {
+                showError(e.message);
+                document.getElementById('formSection').classList.remove('hidden');
+                document.getElementById('loader').classList.remove('active');
+            }
+        }
+        
+        async function pollStatus() {
+            if (!currentJobId) return;
+            
+            try {
+                const response = await fetch(apiUrl + '/status/' + currentJobId);
+                const data = await response.json();
+                
+                if (data.status === 'completed') {
+                    clearInterval(pollInterval);
+                    showResults(data);
+                } else if (data.status === 'error') {
+                    clearInterval(pollInterval);
+                    showError(data.error || 'Processing failed');
+                    document.getElementById('formSection').classList.remove('hidden');
+                    document.getElementById('loader').classList.remove('active');
+                } else {
+                    // Still processing
+                    document.getElementById('progressText').textContent = 
+                        `Job ID: ${currentJobId} • Status: ${data.status}...`;
+                    
+                    // Poll again in 2 seconds
+                    setTimeout(pollStatus, 2000);
+                }
+            } catch (e) {
+                // Retry on network error
+                setTimeout(pollStatus, 2000);
+            }
+        }
+        
+        async function showResults(jobData) {
+            document.getElementById('loader').classList.remove('active');
+            document.getElementById('results').classList.add('active');
+            
+            const summary = document.getElementById('resultSummary');
+            summary.textContent = `Total size: ${jobData.total_output_size_mb} MB • Format: ${jobData.output_format.toUpperCase()}`;
+            
+            const trackList = document.getElementById('trackList');
+            trackList.innerHTML = '';
+            
+            // Fetch detailed stem info
+            let stems = {};
+            try {
+                const response = await fetch(apiUrl + '/stems/' + currentJobId);
+                if (response.ok) {
+                    const data = await response.json();
+                    stems = data.stems;
+                }
+            } catch (e) {
+                // Fallback to job data
+                stems = jobData.stems || {};
+            }
+            
+            const stemEmojis = {
+                vocals: '🎤',
+                drums: '🥁',
+                bass: '🎸',
+                guitar: '🎸',
+                piano: '🎹',
+                other: '🎵'
+            };
+            
+            for (const [stemName, stemInfo] of Object.entries(stems)) {
+                const trackItem = document.createElement('div');
+                trackItem.className = 'track-item';
+                
+                const size = stemInfo.size_mb || '?';
+                
+                trackItem.innerHTML = `
+                    <div class="track-icon">${stemEmojis[stemName] || '🎵'}</div>
+                    <div class="track-info">
+                        <div class="track-name">${stemName}</div>
+                        <div class="track-size">${size} MB</div>
+                    </div>
+                    <audio controls preload="none" src="${apiUrl}/download/${currentJobId}?stem=${stemName}"></audio>
+                    <div class="track-actions">
+                        <button class="btn-small btn-download" onclick="downloadStem('${stemName}')">
+                            Download
+                        </button>
+                    </div>
+                `;
+                
+                trackList.appendChild(trackItem);
+            }
+        }
+        
+        function downloadStem(stemName) {
+            if (!currentJobId) return;
+            window.open(apiUrl + '/download/' + currentJobId + '?stem=' + stemName, '_blank');
+        }
+        
+        function downloadAll() {
+            if (!currentJobId) return;
+            window.open(apiUrl + '/download/' + currentJobId, '_blank');
+        }
+        
+        function resetForm() {
+            currentJobId = null;
+            hideError();
+            document.getElementById('formSection').classList.remove('hidden');
+            document.getElementById('loader').classList.remove('active');
+            document.getElementById('results').classList.remove('active');
+            document.getElementById('videoUrl').value = '';
+            document.getElementById('progressText').textContent = 'This may take 30-60 seconds';
+            checkApiStatus();
+        }
+    </script>
+</body>
+</html>
