@@ -1,0 +1,19 @@
+# Guitar Separation API v2 - Requirements
+# Apple Silicon optimized with Demucs-MLX
+
+# Core
+fastapi>=0.104.0
+uvicorn>=0.24.0
+python-multipart>=0.0.6
+
+# Audio processing
+torch>=2.0.0
+torchaudio>=2.0.0
+soundfile>=0.12.0
+
+# Demucs for source separation
+demucs>=4.0.0
+
+# MLX for Apple Silicon optimization
+mlx>=0.31.0
+demucs-mlx>=1.4.0
