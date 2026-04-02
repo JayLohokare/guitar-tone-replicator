@@ -7,10 +7,12 @@ import os
 import uuid
 import asyncio
 import logging
+import subprocess
+import re
 import numpy as np
 from pathlib import Path
 from typing import Optional
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import FileResponse
 from fastapi.concurrency import run_in_threadpool
 
@@ -21,7 +23,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Guitar Separation API v2",
     description="Apple Silicon optimized guitar stem extraction using Demucs-MLX",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 # Directories
@@ -37,7 +39,8 @@ jobs = {}
 MODEL_NAME = "htdemucs_6s"  # 6-source model with guitar stem
 SAMPLE_RATE = 44100
 MAX_FILE_SIZE_MB = 100
-SUPPORTED_FORMATS = {'.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac', '.wma'}
+SUPPORTED_INPUT_FORMATS = {'.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac', '.wma'}
+SUPPORTED_OUTPUT_FORMATS = {'wav', 'mp3', 'ogg', 'flac'}
 
 # Global model holder
 separator = None
@@ -68,7 +71,39 @@ def get_separator():
     return separator
 
 
-def separate_audio(input_path: str, output_path: str, job_id: str) -> dict:
+def convert_audio(input_path: str, output_path: str, output_format: str) -> str:
+    """Convert audio to desired format using ffmpeg"""
+    output_format = output_format.lower()
+    
+    if output_format == 'wav':
+        # Already WAV, just copy
+        if input_path.endswith('.wav'):
+            import shutil
+            shutil.copy(input_path, output_path)
+            return output_path
+        # Convert to WAV
+        cmd = ['ffmpeg', '-y', '-i', input_path, '-c:a', 'pcm_s16le', output_path]
+    elif output_format == 'mp3':
+        cmd = ['ffmpeg', '-y', '-i', input_path, '-c:a', 'libmp3lame', '-q:a', '0', output_path]
+    elif output_format == 'ogg':
+        # OGG/Opus - good compression, great for messaging
+        cmd = ['ffmpeg', '-y', '-i', input_path, '-c:a', 'libopus', '-b:a', '128k', output_path]
+    elif output_format == 'flac':
+        # FLAC - lossless compression
+        cmd = ['ffmpeg', '-y', '-i', input_path, '-c:a', 'flac', output_path]
+    else:
+        # Default to WAV
+        cmd = ['ffmpeg', '-y', '-i', input_path, '-c:a', 'pcm_s16le', output_path]
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(f"FFmpeg conversion failed: {result.stderr}")
+        raise Exception(f"Audio conversion failed: {result.stderr[:200]}")
+    
+    return output_path
+
+
+def separate_audio(input_path: str, output_path: str, job_id: str, output_format: str = 'wav') -> dict:
     """Separate audio and extract guitar stem"""
     import time
     
@@ -76,6 +111,9 @@ def separate_audio(input_path: str, output_path: str, job_id: str) -> dict:
     
     logger.info(f"[{job_id}] Processing {input_path}")
     start_time = time.time()
+    
+    # Always extract to WAV first
+    wav_output_path = output_path if output_format == 'wav' else output_path.replace(f'.{output_format}', '.wav')
     
     if USE_MLX:
         # MLX path - Apple Silicon optimized
@@ -92,7 +130,7 @@ def separate_audio(input_path: str, output_path: str, job_id: str) -> dict:
         
         # Save as WAV using soundfile (MLX doesn't have native audio save)
         import soundfile as sf
-        sf.write(output_path, guitar_audio.T, SAMPLE_RATE)  # Transpose for (samples, channels)
+        sf.write(wav_output_path, guitar_audio.T, SAMPLE_RATE)  # Transpose for (samples, channels)
         
     else:
         # Standard Demucs PyTorch path
@@ -117,21 +155,30 @@ def separate_audio(input_path: str, output_path: str, job_id: str) -> dict:
         guitar_wave = sources[4]
         
         # Save as WAV
-        torchaudio.save(output_path, guitar_wave, SAMPLE_RATE)
+        torchaudio.save(wav_output_path, guitar_wave, SAMPLE_RATE)
+    
+    # Convert to desired format if not WAV
+    final_output_path = output_path
+    if output_format != 'wav':
+        logger.info(f"[{job_id}] Converting to {output_format.upper()}")
+        convert_audio(wav_output_path, output_path, output_format)
+        # Remove intermediate WAV
+        os.remove(wav_output_path)
     
     elapsed = time.time() - start_time
     
     # Get file sizes
     input_size = os.path.getsize(input_path)
-    output_size = os.path.getsize(output_path)
+    output_size = os.path.getsize(final_output_path)
     
-    logger.info(f"[{job_id}] Completed in {elapsed:.1f}s")
+    logger.info(f"[{job_id}] Completed in {elapsed:.1f}s ({output_format.upper()}, {output_size / (1024*1024):.1f}MB)")
     
     return {
         "status": "completed",
         "input_size_mb": round(input_size / (1024 * 1024), 2),
         "output_size_mb": round(output_size / (1024 * 1024), 2),
-        "output_file": output_path,
+        "output_file": final_output_path,
+        "output_format": output_format,
         "engine": "MLX" if USE_MLX else "PyTorch",
         "processing_time_seconds": round(elapsed, 1)
     }
@@ -146,20 +193,193 @@ async def health_check():
         "service": "Guitar Separation API v2",
         "model": MODEL_NAME,
         "optimization": "Apple Silicon (MLX)" if USE_MLX else "PyTorch",
-        "max_file_size_mb": MAX_FILE_SIZE_MB
+        "max_file_size_mb": MAX_FILE_SIZE_MB,
+        "youtube_support": True,
+        "supported_output_formats": list(SUPPORTED_OUTPUT_FORMATS),
+        "default_output_format": "wav"
     }
 
 
+def download_youtube_audio(url: str, output_dir: Path, job_id: str) -> tuple:
+    """Download audio from YouTube URL and return (audio_path, title)"""
+    import time
+    
+    logger.info(f"[{job_id}] Downloading YouTube: {url}")
+    start_time = time.time()
+    
+    # Output template - use fixed extension since we convert to wav
+    output_path = output_dir / f"{job_id}"
+    output_template = str(output_path)
+    
+    # yt-dlp command - download best audio, convert to wav
+    cmd = [
+        "yt-dlp",
+        "-x",  # Extract audio
+        "--audio-format", "wav",
+        "--audio-quality", "0",  # Best quality
+        "-o", output_template,
+        "--no-playlist",  # Single video only
+        "--no-warnings",
+        url
+    ]
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        
+        if result.returncode != 0:
+            error_msg = result.stderr.strip() or "Unknown download error"
+            logger.error(f"[{job_id}] YouTube download failed: {error_msg}")
+            raise Exception(f"YouTube download failed: {error_msg}")
+        
+        # yt-dlp converts to wav and saves as {job_id}.wav
+        audio_file = output_dir / f"{job_id}.wav"
+        
+        if not audio_file.exists():
+            # Fallback: find any file with job_id prefix
+            downloaded_files = list(output_dir.glob(f"{job_id}.*"))
+            if downloaded_files:
+                audio_file = downloaded_files[0]
+            else:
+                raise Exception(f"Downloaded file not found. stdout: {result.stdout[:200]}, stderr: {result.stderr[:200]}")
+        
+        # Extract title from stdout (yt-dlp prints progress info)
+        lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
+        title = f"YouTube_{job_id}"
+        # Try to find title line
+        for line in reversed(lines):
+            if line and not line.startswith('[') and len(line) > 3:
+                title = re.sub(r'[^\w\s-]', '', line)[:100]
+                break
+        
+        elapsed = time.time() - start_time
+        logger.info(f"[{job_id}] Downloaded in {elapsed:.1f}s: {audio_file.name}")
+        
+        return str(audio_file), title
+        
+    except subprocess.TimeoutExpired:
+        raise Exception("YouTube download timed out (5 min limit)")
+    except FileNotFoundError:
+        raise Exception("yt-dlp not installed. Run: brew install yt-dlp")
+
+
+@app.post("/youtube")
+async def youtube_endpoint(
+    url: str = Form(...),
+    format: str = Form("wav")
+):
+    """Download YouTube audio and extract guitar stem
+    
+    Parameters:
+    - url: YouTube video URL
+    - format: Output format (wav, mp3, ogg, flac). Default: wav
+    
+    Returns:
+    - job_id: Use to check status and download result
+    """
+    
+    # Validate format
+    output_format = format.lower()
+    if output_format not in SUPPORTED_OUTPUT_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported format. Supported: {', '.join(SUPPORTED_OUTPUT_FORMATS)}"
+        )
+    
+    # Validate YouTube URL
+    youtube_patterns = [
+        r'(youtube\.com/watch\?v=)',
+        r'(youtu\.be/)',
+        r'(youtube\.com/shorts/)',
+        r'(youtube\.com/embed/)',
+    ]
+    
+    if not any(re.search(p, url) for p in youtube_patterns):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid YouTube URL. Supported: youtube.com/watch, youtu.be, shorts"
+        )
+    
+    # Generate job ID
+    job_id = str(uuid.uuid4())[:8]
+    
+    # Track job
+    jobs[job_id] = {
+        "status": "downloading",
+        "url": url,
+        "output_format": output_format,
+        "started": asyncio.get_event_loop().time()
+    }
+    
+    try:
+        # Download YouTube audio
+        audio_path, title = await run_in_threadpool(
+            download_youtube_audio,
+            url,
+            UPLOAD_DIR,
+            job_id
+        )
+        
+        # Update job status
+        jobs[job_id]["status"] = "processing"
+        jobs[job_id]["title"] = title
+        
+        # Output path with correct extension
+        output_path = OUTPUT_DIR / f"{job_id}_guitar.{output_format}"
+        
+        # Run separation in thread pool
+        result = await run_in_threadpool(
+            separate_audio,
+            audio_path,
+            str(output_path),
+            job_id,
+            output_format
+        )
+        
+        jobs[job_id].update(result)
+        
+        return {
+            "job_id": job_id,
+            "status": "processing",
+            "title": title,
+            "output_format": output_format
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        jobs[job_id] = {"status": "error", "error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/separate")
-async def separate_endpoint(file: UploadFile = File(...)):
-    """Upload audio file for guitar extraction"""
+async def separate_endpoint(
+    file: UploadFile = File(...),
+    format: str = Form("wav")
+):
+    """Upload audio file for guitar extraction
+    
+    Parameters:
+    - file: Audio file (mp3, wav, flac, ogg, m4a, aac, wma)
+    - format: Output format (wav, mp3, ogg, flac). Default: wav
+    
+    Returns:
+    - job_id: Use to check status and download result
+    """
+    
+    # Validate format
+    output_format = format.lower()
+    if output_format not in SUPPORTED_OUTPUT_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported format. Supported: {', '.join(SUPPORTED_OUTPUT_FORMATS)}"
+        )
     
     # Validate file extension
     ext = Path(file.filename).suffix.lower()
-    if ext not in SUPPORTED_FORMATS:
+    if ext not in SUPPORTED_INPUT_FORMATS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported format. Supported: {', '.join(SUPPORTED_FORMATS)}"
+            detail=f"Unsupported format. Supported: {', '.join(SUPPORTED_INPUT_FORMATS)}"
         )
     
     # Generate job ID
@@ -184,23 +404,25 @@ async def separate_endpoint(file: UploadFile = File(...)):
         jobs[job_id] = {
             "status": "processing",
             "filename": file.filename,
+            "output_format": output_format,
             "started": asyncio.get_event_loop().time()
         }
         
-        # Output path
-        output_path = OUTPUT_DIR / f"{job_id}_guitar.wav"
+        # Output path with correct extension
+        output_path = OUTPUT_DIR / f"{job_id}_guitar.{output_format}"
         
         # Run separation in thread pool
         result = await run_in_threadpool(
             separate_audio,
             str(input_path),
             str(output_path),
-            job_id
+            job_id,
+            output_format
         )
         
         jobs[job_id].update(result)
         
-        return {"job_id": job_id, "status": "processing"}
+        return {"job_id": job_id, "status": "processing", "output_format": output_format}
         
     except HTTPException:
         raise
@@ -224,6 +446,9 @@ async def get_status(job_id: str):
     if "output_size_mb" in job:
         response["output_size_mb"] = job["output_size_mb"]
     
+    if "output_format" in job:
+        response["output_format"] = job["output_format"]
+    
     return response
 
 
@@ -240,14 +465,28 @@ async def download_result(job_id: str):
             detail=f"Job status: {job['status']}"
         )
     
-    output_path = OUTPUT_DIR / f"{job_id}_guitar.wav"
+    output_format = job.get("output_format", "wav")
+    output_path = OUTPUT_DIR / f"{job_id}_guitar.{output_format}"
+    
     if not output_path.exists():
         raise HTTPException(status_code=404, detail="Output file not found")
     
+    # Determine media type
+    media_types = {
+        'wav': 'audio/wav',
+        'mp3': 'audio/mpeg',
+        'ogg': 'audio/ogg',
+        'flac': 'audio/flac'
+    }
+    
+    filename_base = job.get("filename", "audio")
+    if "title" in job:
+        filename_base = job["title"]
+    
     return FileResponse(
         output_path,
-        media_type="audio/wav",
-        filename=f"{Path(job['filename']).stem}_guitar.wav"
+        media_type=media_types.get(output_format, "audio/wav"),
+        filename=f"{Path(filename_base).stem}_guitar.{output_format}"
     )
 
 
