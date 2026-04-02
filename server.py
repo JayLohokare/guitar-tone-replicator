@@ -17,6 +17,7 @@ from typing import Optional, List
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import FileResponse
 from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -26,6 +27,22 @@ app = FastAPI(
     title="Stem Separation API v3",
     description="Apple Silicon optimized stem extraction using Demucs-MLX. Extracts all stems: vocals, drums, bass, other, guitar, piano",
     version="3.0.0"
+)
+
+# Enable CORS for GitHub Pages and local development
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://jaylohokare.github.io",
+        "http://localhost:3000",
+        "http://localhost:8080",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:8080",
+        "*",  # Allow all origins for flexibility
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Directories
