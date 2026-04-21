@@ -1,612 +1,526 @@
 """
-Stem Separation API v3 - Apple Silicon Optimized
-Uses Demucs-MLX for faster inference on Apple Silicon
-Extracts all stems: vocals, drums, bass, other, guitar, piano
+Tone Replicator - Local API Server
+FastAPI backend with full end-to-end pipeline:
+  Video URL → Download → Guitar Stem → Train Tone Model → CoreML Export
 """
-
 import os
+import sys
+import json
 import uuid
-import asyncio
-import logging
+import threading
+import tempfile
 import subprocess
-import re
-import zipfile
-import numpy as np
 from pathlib import Path
-from typing import Optional, List
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
-from fastapi.responses import FileResponse
-from fastapi.concurrency import run_in_threadpool
-from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional, Dict
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+sys.path.insert(0, str(Path(__file__).parent))
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from src.core.trainer import ToneTrainer
+from src.separation.separator import GuitarSeparator, prepare_target_tone
 
 app = FastAPI(
-    title="Stem Separation API v3",
-    description="Apple Silicon optimized stem extraction using Demucs-MLX. Extracts all stems: vocals, drums, bass, other, guitar, piano",
-    version="3.0.0"
+    title="Tone Replicator API",
+    description="Local API for guitar tone replication — end-to-end pipeline",
+    version="2.0.0",
 )
 
-# Enable CORS for GitHub Pages and local development
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://jaylohokare.github.io",
-        "http://localhost:3000",
-        "http://localhost:8080",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:8080",
-        "*",  # Allow all origins for flexibility
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
-# Directories
-UPLOAD_DIR = Path(os.path.expanduser("~/guitar-api-v2/uploads"))
-OUTPUT_DIR = Path(os.path.expanduser("~/guitar-api-v2/outputs"))
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# Storage
+MODELS_DIR = Path.home() / "ToneReplicator" / "models"
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+UPLOADS_DIR = Path(tempfile.gettempdir()) / "tone_replicator_uploads"
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+DOWNLOADS_DIR = Path(tempfile.gettempdir()) / "tone_replicator_downloads"
+DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Job tracking
-jobs = {}
+# Active training jobs
+jobs: Dict[str, dict] = {}
 
-# Model configuration
-MODEL_NAME = "htdemucs_6s"  # 6-source model
-SAMPLE_RATE = 44100
-MAX_FILE_SIZE_MB = 100
-SUPPORTED_INPUT_FORMATS = {'.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac', '.wma'}
-SUPPORTED_OUTPUT_FORMATS = {'wav', 'mp3', 'ogg', 'flac'}
+# ============================================================
+# Models
+# ============================================================
 
-# All available stems from htdemucs_6s
-STEMS = ['drums', 'bass', 'other', 'vocals', 'guitar', 'piano']
-STEM_ORDER = ['drums', 'bass', 'other', 'vocals', 'guitar', 'piano']  # PyTorch order
+class TrainRequest(BaseModel):
+    song_path: str = ""
+    model_name: str = "MyTone"
+    model_type: str = "wavenet"
+    model_size: str = "standard"
+    epochs: int = 100
+    skip_separation: bool = False
 
-# Global model holder
-separator = None
-USE_MLX = False
+class ApplyRequest(BaseModel):
+    model_path: str
+    di_path: str
+    output_path: str = ""
 
+class PipelineRequest(BaseModel):
+    """End-to-end: URL → train → CoreML model ready."""
+    url: str
+    model_name: str = "MyTone"
+    model_type: str = "wavenet"
+    model_size: str = "standard"  # v2: standard default (bigger receptive field)
+    epochs: int = 200  # v2: more epochs for better convergence
+    start_time: Optional[float] = None   # seconds into the video
+    end_time: Optional[float] = None     # seconds into the video
+    convert_coreml: bool = True
 
-def get_separator():
-    """Lazy load the separator model"""
-    global separator, USE_MLX
-    if separator is None:
-        logger.info("Loading Demucs model...")
-        try:
-            # Try MLX first (Apple Silicon optimized)
-            from demucs_mlx import Separator
-            logger.info("Using Demucs-MLX (Apple Silicon optimized)")
-            separator = Separator(model_name=MODEL_NAME)
-            USE_MLX = True
-            logger.info("Model loaded successfully (MLX)")
-        except Exception as e:
-            logger.warning(f"MLX not available: {e}, falling back to PyTorch")
-            # Fallback to regular demucs
-            import torch
-            from demucs.pretrained import get_model
-            logger.info("Using standard Demucs (PyTorch)")
-            separator = get_model(MODEL_NAME)
-            USE_MLX = False
-            logger.info("Model loaded successfully (PyTorch)")
-    return separator
+class URLDownloadRequest(BaseModel):
+    url: str
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
 
+# ============================================================
+# Health
+# ============================================================
 
-def convert_audio(input_path: str, output_path: str, output_format: str) -> str:
-    """Convert audio to desired format using ffmpeg"""
-    output_format = output_format.lower()
-    
-    if output_format == 'wav':
-        if input_path.endswith('.wav'):
-            import shutil
-            shutil.copy(input_path, output_path)
-            return output_path
-        cmd = ['ffmpeg', '-y', '-i', input_path, '-c:a', 'pcm_s16le', output_path]
-    elif output_format == 'mp3':
-        cmd = ['ffmpeg', '-y', '-i', input_path, '-c:a', 'libmp3lame', '-q:a', '0', output_path]
-    elif output_format == 'ogg':
-        cmd = ['ffmpeg', '-y', '-i', input_path, '-c:a', 'libopus', '-b:a', '128k', output_path]
-    elif output_format == 'flac':
-        cmd = ['ffmpeg', '-y', '-i', input_path, '-c:a', 'flac', output_path]
-    else:
-        cmd = ['ffmpeg', '-y', '-i', input_path, '-c:a', 'pcm_s16le', output_path]
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        logger.error(f"FFmpeg conversion failed: {result.stderr}")
-        raise Exception(f"Audio conversion failed: {result.stderr[:200]}")
-    
-    return output_path
+@app.get("/health")
+async def health():
+    return {"status": "ok", "version": "2.0.0"}
 
+# ============================================================
+# End-to-End Pipeline (the main flow)
+# ============================================================
 
-def separate_audio_all(
-    input_path: str,
-    output_dir: Path,
-    job_id: str,
-    output_format: str = 'wav',
-    stems: Optional[List[str]] = None
-) -> dict:
-    """Separate audio and extract all stems"""
-    import time
-    
-    separator = get_separator()
-    stems_to_extract = stems if stems else STEMS
-    
-    logger.info(f"[{job_id}] Processing {input_path} for stems: {stems_to_extract}")
-    start_time = time.time()
-    
-    extracted_stems = {}
-    
-    if USE_MLX:
-        # MLX path - Apple Silicon optimized
-        result = separator.separate_audio_file(input_path)
-        full_audio, sources = result
-        
-        logger.info(f"[{job_id}] Separation complete, saving stems...")
-        
-        import soundfile as sf
-        
-        for stem_name in stems_to_extract:
-            if stem_name in sources:
-                stem_audio = sources[stem_name]
-                wav_path = output_dir / f"{job_id}_{stem_name}.wav"
-                sf.write(str(wav_path), stem_audio.T, SAMPLE_RATE)
-                extracted_stems[stem_name] = str(wav_path)
-                logger.info(f"[{job_id}] Saved {stem_name}: shape={stem_audio.shape}")
-        
-    else:
-        # Standard Demucs PyTorch path
-        import torch
-        import torchaudio
-        from demucs.apply import apply_model
-        
-        waveform, sr = torchaudio.load(input_path)
-        
-        if sr != SAMPLE_RATE:
-            resampler = torchaudio.transforms.Resample(sr, SAMPLE_RATE)
-            waveform = resampler(waveform)
-        
-        with torch.no_grad():
-            sources = apply_model(separator, waveform[None], progress=False)[0]
-        
-        # Sources order: drums, bass, other, vocals, guitar, piano
-        for i, stem_name in enumerate(STEM_ORDER):
-            if stem_name in stems_to_extract:
-                stem_wave = sources[i]
-                wav_path = output_dir / f"{job_id}_{stem_name}.wav"
-                torchaudio.save(str(wav_path), stem_wave, SAMPLE_RATE)
-                extracted_stems[stem_name] = str(wav_path)
-                logger.info(f"[{job_id}] Saved {stem_name}")
-    
-    # Convert to desired format if not WAV
-    final_stems = {}
-    input_size = os.path.getsize(input_path)
-    
-    for stem_name, wav_path in extracted_stems.items():
-        if output_format == 'wav':
-            final_path = wav_path
-        else:
-            final_path = wav_path.replace('.wav', f'.{output_format}')
-            convert_audio(wav_path, final_path, output_format)
-            os.remove(wav_path)
-        
-        final_stems[stem_name] = {
-            "path": final_path,
-            "size_mb": round(os.path.getsize(final_path) / (1024 * 1024), 2)
-        }
-    
-    # Create zip file with all stems
-    zip_path = output_dir / f"{job_id}_all.zip"
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for stem_name, stem_info in final_stems.items():
-            zf.write(stem_info['path'], f"{stem_name}.{output_format}")
-    
-    elapsed = time.time() - start_time
-    total_size = sum(s['size_mb'] for s in final_stems.values())
-    
-    logger.info(f"[{job_id}] Completed in {elapsed:.1f}s - {len(final_stems)} stems, {total_size:.1f}MB total")
-    
-    return {
-        "status": "completed",
-        "input_size_mb": round(input_size / (1024 * 1024), 2),
-        "stems": final_stems,
-        "total_output_size_mb": round(total_size, 2),
-        "zip_file": str(zip_path),
-        "output_format": output_format,
-        "engine": "MLX" if USE_MLX else "PyTorch",
-        "processing_time_seconds": round(elapsed, 1)
+@app.post("/pipeline")
+async def start_pipeline(request: PipelineRequest):
+    """
+    End-to-end pipeline:
+    1. Download audio from URL (YouTube, direct link, etc.)
+    2. Extract guitar stem
+    3. Train tone model
+    4. (Optional) Convert to CoreML for AUv3 plugin
+    """
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "status": "starting",
+        "step": "starting",
+        "progress": 0,
+        "message": "Initializing pipeline...",
+        "model_path": None,
+        "coreml_path": None,
+        "result": None,
     }
-
-
-def download_youtube_audio(url: str, output_dir: Path, job_id: str) -> tuple:
-    """Download audio from YouTube URL and return (audio_path, title)"""
-    import time
     
-    logger.info(f"[{job_id}] Downloading YouTube: {url}")
-    start_time = time.time()
+    thread = threading.Thread(
+        target=_run_pipeline,
+        args=(job_id, request),
+        daemon=True,
+    )
+    thread.start()
     
-    output_path = output_dir / f"{job_id}"
-    output_template = str(output_path)
+    return {"job_id": job_id}
+
+@app.get("/progress/{job_id}")
+async def get_progress(job_id: str):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return jobs[job_id]
+
+# ============================================================
+# Download from URL
+# ============================================================
+
+@app.post("/download_url")
+async def download_from_url(request: URLDownloadRequest):
+    """Download audio from a URL (YouTube, SoundCloud, direct link)."""
+    try:
+        output_path = _download_audio(request.url, request.start_time, request.end_time)
+        return {"path": str(output_path), "filename": Path(output_path).name}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================
+# Train (standalone)
+# ============================================================
+
+@app.post("/train")
+async def start_training(request: TrainRequest):
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "status": "starting", "step": "starting", "progress": 0,
+        "message": "Initializing...", "model_path": None, "result": None,
+    }
+    thread = threading.Thread(target=_run_training, args=(job_id, request), daemon=True)
+    thread.start()
+    return {"job_id": job_id}
+
+# ============================================================
+# Apply
+# ============================================================
+
+@app.post("/apply")
+async def apply_tone(request: ApplyRequest):
+    trainer = ToneTrainer(device="auto")
+    trainer.load_model(request.model_path)
+    output_path = request.output_path or str(Path(tempfile.gettempdir()) / "tone_applied.wav")
+    result_path = trainer.process_audio(request.di_path, output_path)
+    return {"output_path": result_path, "status": "ok"}
+
+# ============================================================
+# Upload
+# ============================================================
+
+@app.post("/upload")
+async def upload_audio(file: UploadFile = File(...)):
+    file_path = UPLOADS_DIR / file.filename
+    with open(file_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+    return {"path": str(file_path), "filename": file.filename}
+
+# ============================================================
+# Models
+# ============================================================
+
+@app.get("/models")
+async def list_models():
+    models = []
+    for model_dir in MODELS_DIR.iterdir():
+        if model_dir.is_dir() and (model_dir / "metadata.json").exists():
+            with open(model_dir / "metadata.json") as f:
+                metadata = json.load(f)
+            coreml_exists = (model_dir / "model.mlpackage").exists()
+            models.append({
+                "id": model_dir.name,
+                "name": model_dir.name,
+                "model_path": str(model_dir),
+                "coreml_ready": coreml_exists,
+                **metadata,
+            })
+    return models
+
+@app.post("/models/{model_id}/convert_coreml")
+async def convert_to_coreml(model_id: str):
+    """Convert a trained PyTorch model to CoreML format for the AUv3 plugin."""
+    model_dir = MODELS_DIR / model_id
+    if not model_dir.exists():
+        raise HTTPException(status_code=404, detail="Model not found")
+    
+    try:
+        coreml_path = _convert_to_coreml(str(model_dir))
+        return {"status": "ok", "coreml_path": str(coreml_path)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================
+# Internal: Pipeline Runner
+# ============================================================
+
+def _run_pipeline(job_id: str, request: PipelineRequest):
+    """Run the full pipeline in a background thread."""
+    try:
+        # Step 1: Download audio from URL
+        jobs[job_id].update({
+            "status": "downloading", "step": "downloading",
+            "progress": 5, "message": f"Downloading from URL...",
+        })
+        
+        audio_path = _download_audio(request.url, request.start_time, request.end_time)
+        jobs[job_id].update({"progress": 15, "message": f"Downloaded: {Path(audio_path).name}"})
+        
+        # Step 2: Extract guitar stem
+        jobs[job_id].update({
+            "status": "separating", "step": "separating",
+            "progress": 20, "message": "Separating guitar stem...",
+        })
+        
+        separator = GuitarSeparator()
+        if separator.health_check():
+            guitar_stem = separator.separate_file(audio_path)
+            jobs[job_id].update({"progress": 35, "message": "Guitar stem extracted!"})
+        else:
+            # If separation API not available, use the whole file
+            guitar_stem = audio_path
+            jobs[job_id].update({"progress": 35, "message": "Using full audio (separation API not available)"})
+        
+        # Step 3: Prepare target tone
+        jobs[job_id].update({
+            "status": "preparing", "step": "preparing",
+            "progress": 40, "message": "Preparing training data...",
+        })
+        prepared_stem = prepare_target_tone(guitar_stem)
+        
+        # Step 4: Train the model
+        jobs[job_id].update({
+            "status": "training", "step": "training",
+            "progress": 45, "message": "Training tone model...",
+        })
+        
+        model_dir = MODELS_DIR / request.model_name
+        model_dir.mkdir(parents=True, exist_ok=True)
+        
+        trainer = ToneTrainer(
+            model_type=request.model_type,
+            model_size=request.model_size,
+            segment_length=16384,  # v2: longer segments
+            pre_emphasis=0.85,     # v2: pre-emphasis filter
+            mrstft_weight=0.25,    # v2: more perceptual loss weight
+        )
+        
+        def progress_callback(entry):
+            epoch = entry.get("epoch", 0)
+            val_esr = entry.get("val_esr", 1.0)
+            pct = 45 + min(epoch / request.epochs, 1.0) * 45
+            jobs[job_id].update({
+                "epoch": epoch,
+                "val_esr": val_esr,
+                "progress": pct,
+                "message": f"Epoch {epoch}: ESR = {val_esr:.4f}",
+            })
+        
+        result = trainer.train_blind(
+            target_tone_path=prepared_stem,
+            epochs=request.epochs,
+            save_path=str(model_dir),
+            progress_callback=progress_callback,
+        )
+        
+        # Step 5: Convert to CoreML
+        coreml_path = None
+        if request.convert_coreml:
+            jobs[job_id].update({
+                "status": "converting", "step": "converting",
+                "progress": 92, "message": "Converting to CoreML...",
+            })
+            try:
+                coreml_path = _convert_to_coreml(str(model_dir))
+                jobs[job_id].update({"message": "CoreML model ready!"})
+            except Exception as e:
+                # CoreML conversion requires Python 3.12 (coremltools binary compat)
+                # Provide helpful message
+                import sys
+                msg = f"CoreML conversion requires Python 3.12 (running {sys.version_info.major}.{sys.version_info.minor}). "
+                msg += "Run: python3.12 CoreMLConverter/convert_model.py --model-dir " + str(model_dir)
+                jobs[job_id].update({"message": f"PyTorch model saved. {msg}"})
+        
+        # Done!
+        jobs[job_id].update({
+            "status": "complete", "step": "complete",
+            "progress": 100,
+            "message": f"Done! ESR = {result['best_val_esr']:.4f}",
+            "model_path": str(model_dir),
+            "coreml_path": str(coreml_path) if coreml_path else None,
+            "result": result,
+        })
+        
+    except Exception as e:
+        import traceback
+        jobs[job_id].update({
+            "status": "error", "step": "error",
+            "message": f"{type(e).__name__}: {str(e)}",
+        })
+
+def _run_training(job_id: str, request: TrainRequest):
+    """Run training only (legacy endpoint)."""
+    try:
+        # Separation
+        jobs[job_id].update({
+            "status": "separating", "step": "separating",
+            "progress": 0, "message": "Separating guitar stem...",
+        })
+        
+        if request.skip_separation:
+            guitar_stem = request.song_path
+        else:
+            separator = GuitarSeparator()
+            guitar_stem = separator.separate_file(request.song_path) if separator.health_check() else request.song_path
+        
+        jobs[job_id].update({"progress": 20, "message": "Guitar stem ready!"})
+        
+        # Prepare
+        jobs[job_id].update({
+            "status": "preparing", "step": "preparing",
+            "progress": 25, "message": "Preparing training data...",
+        })
+        prepared_stem = prepare_target_tone(guitar_stem)
+        jobs[job_id].update({"progress": 30, "message": "Training data prepared!"})
+        
+        # Train
+        model_dir = MODELS_DIR / request.model_name
+        model_dir.mkdir(parents=True, exist_ok=True)
+        
+        trainer = ToneTrainer(
+            model_type=request.model_type, 
+            model_size=request.model_size,
+            segment_length=16384,  # v2: longer segments
+            pre_emphasis=0.85,     # v2: pre-emphasis
+            mrstft_weight=0.25,    # v2: more perceptual loss
+        )
+        
+        def progress_callback(entry):
+            epoch = entry.get("epoch", 0)
+            val_esr = entry.get("val_esr", 1.0)
+            pct = 30 + min(epoch / request.epochs, 1.0) * 65
+            jobs[job_id].update({
+                "status": "training", "step": "training",
+                "epoch": epoch, "val_esr": val_esr, "progress": pct,
+                "message": f"Epoch {epoch}: ESR = {val_esr:.4f}",
+            })
+        
+        result = trainer.train_blind(
+            target_tone_path=prepared_stem,
+            epochs=request.epochs,
+            save_path=str(model_dir),
+            progress_callback=progress_callback,
+        )
+        
+        jobs[job_id].update({
+            "status": "complete", "step": "complete", "progress": 100,
+            "message": f"Training complete! ESR = {result['best_val_esr']:.4f}",
+            "model_path": str(model_dir), "result": result,
+        })
+        
+    except Exception as e:
+        jobs[job_id].update({
+            "status": "error", "step": "error", "message": str(e),
+        })
+
+# ============================================================
+# Internal: Audio Download
+# ============================================================
+
+def _download_audio(url: str, start_time: float = None, end_time: float = None) -> str:
+    """
+    Download audio from a URL. Supports:
+    - YouTube (via yt-dlp)
+    - Direct links to audio/video files
+    - Local file paths (file:// or absolute paths)
+    - SoundCloud, etc.
+    """
+    # Handle local files
+    if url.startswith("file://"):
+        local_path = url.replace("file://", "")
+        if os.path.exists(local_path):
+            return local_path
+        raise FileNotFoundError(f"Local file not found: {local_path}")
+    
+    if os.path.exists(url):
+        return url
+    
+    # Check if it's a direct audio/video link
+    audio_extensions = {'.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aac', '.wma', '.aiff'}
+    url_path = Path(url.split('?')[0].split('#')[0])
+    
+    if url_path.suffix.lower() in audio_extensions:
+        import requests
+        resp = requests.get(url, stream=True)
+        resp.raise_for_status()
+        ext = url_path.suffix.lower()
+        output_path = DOWNLOADS_DIR / f"download_{uuid.uuid4().hex[:8]}{ext}"
+        with open(output_path, 'wb') as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+        return str(output_path)
+    
+    # Use yt-dlp for video sites (YouTube, SoundCloud, etc.)
+    output_template = str(DOWNLOADS_DIR / "download_%(id)s.%(ext)s")
     
     cmd = [
-        "yt-dlp",
-        "-x",
+        sys.executable, "-m", "yt_dlp",
+        "-x",  # Extract audio
         "--audio-format", "wav",
         "--audio-quality", "0",
         "-o", output_template,
         "--no-playlist",
-        "--no-warnings",
-        url
+        "--quiet",
     ]
     
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    cmd.append(url)
+    
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(f"yt-dlp failed: {result.stderr}")
+    
+    # Find the downloaded file
+    downloaded = sorted(DOWNLOADS_DIR.glob("download_*.*"), key=lambda p: p.stat().st_mtime)
+    if not downloaded:
+        raise RuntimeError("No audio file downloaded")
+    
+    audio_path = str(downloaded[-1])
+    
+    # Trim if time range specified
+    if start_time is not None or end_time is not None:
+        trimmed_path = str(DOWNLOADS_DIR / f"trimmed_{Path(audio_path).stem}.wav")
+        trim_cmd = ["ffmpeg", "-y", "-i", audio_path]
+        if start_time is not None:
+            trim_cmd.extend(["-ss", str(start_time)])
+        if end_time is not None:
+            trim_cmd.extend(["-to", str(end_time)])
+        trim_cmd.extend(["-ar", "44100", "-ac", "1", trimmed_path])
         
-        if result.returncode != 0:
-            error_msg = result.stderr.strip() or "Unknown download error"
-            logger.error(f"[{job_id}] YouTube download failed: {error_msg}")
-            raise Exception(f"YouTube download failed: {error_msg}")
-        
-        audio_file = output_dir / f"{job_id}.wav"
-        
-        if not audio_file.exists():
-            downloaded_files = list(output_dir.glob(f"{job_id}.*"))
-            if downloaded_files:
-                audio_file = downloaded_files[0]
-            else:
-                raise Exception(f"Downloaded file not found. stdout: {result.stdout[:200]}, stderr: {result.stderr[:200]}")
-        
-        lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
-        title = f"YouTube_{job_id}"
-        for line in reversed(lines):
-            if line and not line.startswith('[') and len(line) > 3:
-                title = re.sub(r'[^\w\s-]', '', line)[:100]
-                break
-        
-        elapsed = time.time() - start_time
-        logger.info(f"[{job_id}] Downloaded in {elapsed:.1f}s: {audio_file.name}")
-        
-        return str(audio_file), title
-        
-    except subprocess.TimeoutExpired:
-        raise Exception("YouTube download timed out (5 min limit)")
-    except FileNotFoundError:
-        raise Exception("yt-dlp not installed. Run: brew install yt-dlp")
+        result = subprocess.run(trim_cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            audio_path = trimmed_path
+    
+    return audio_path
 
+# ============================================================
+# Internal: CoreML Conversion
+# ============================================================
 
-@app.get("/")
-async def health_check():
-    """Health check endpoint"""
-    global USE_MLX
-    return {
-        "status": "online",
-        "service": "Stem Separation API v3",
-        "model": MODEL_NAME,
-        "optimization": "Apple Silicon (MLX)" if USE_MLX else "PyTorch",
-        "max_file_size_mb": MAX_FILE_SIZE_MB,
-        "youtube_support": True,
-        "supported_output_formats": list(SUPPORTED_OUTPUT_FORMATS),
-        "available_stems": STEMS,
-        "default_output_format": "wav"
-    }
-
-
-@app.post("/youtube")
-async def youtube_endpoint(
-    url: str = Form(...),
-    format: str = Form("wav"),
-    stems: str = Form(None)
-):
-    """Download YouTube audio and extract stems
+def _convert_to_coreml(model_dir: str) -> Path:
+    """Convert a trained PyTorch model to CoreML format."""
+    import torch
+    import coremltools as ct
+    from src.core.model import create_model
     
-    Parameters:
-    - url: YouTube video URL
-    - format: Output format (wav, mp3, ogg, flac). Default: wav
-    - stems: Comma-separated stems to extract (default: all). Options: vocals,drums,bass,other,guitar,piano
-    
-    Returns:
-    - job_id: Use to check status and download results
-    """
-    
-    output_format = format.lower()
-    if output_format not in SUPPORTED_OUTPUT_FORMATS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported format. Supported: {', '.join(SUPPORTED_OUTPUT_FORMATS)}"
-        )
-    
-    # Parse stems
-    stems_list = None
-    if stems:
-        stems_list = [s.strip().lower() for s in stems.split(',')]
-        invalid_stems = [s for s in stems_list if s not in STEMS]
-        if invalid_stems:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid stems: {invalid_stems}. Available: {', '.join(STEMS)}"
-            )
-    
-    youtube_patterns = [
-        r'(youtube\.com/watch\?v=)',
-        r'(youtu\.be/)',
-        r'(youtube\.com/shorts/)',
-        r'(youtube\.com/embed/)',
-    ]
-    
-    if not any(re.search(p, url) for p in youtube_patterns):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid YouTube URL. Supported: youtube.com/watch, youtu.be, shorts"
-        )
-    
-    job_id = str(uuid.uuid4())[:8]
-    
-    jobs[job_id] = {
-        "status": "downloading",
-        "url": url,
-        "output_format": output_format,
-        "stems": stems_list if stems_list else "all",
-        "started": asyncio.get_event_loop().time()
-    }
-    
-    try:
-        audio_path, title = await run_in_threadpool(
-            download_youtube_audio,
-            url,
-            UPLOAD_DIR,
-            job_id
-        )
-        
-        jobs[job_id]["status"] = "processing"
-        jobs[job_id]["title"] = title
-        
-        result = await run_in_threadpool(
-            separate_audio_all,
-            audio_path,
-            OUTPUT_DIR,
-            job_id,
-            output_format,
-            stems_list
-        )
-        
-        jobs[job_id].update(result)
-        
-        return {
-            "job_id": job_id,
-            "status": "processing",
-            "title": title,
-            "output_format": output_format,
-            "stems": stems_list if stems_list else "all"
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        jobs[job_id] = {"status": "error", "error": str(e)}
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/separate")
-async def separate_endpoint(
-    file: UploadFile = File(...),
-    format: str = Form("wav"),
-    stems: str = Form(None)
-):
-    """Upload audio file for stem extraction
-    
-    Parameters:
-    - file: Audio file (mp3, wav, flac, ogg, m4a, aac, wma)
-    - format: Output format (wav, mp3, ogg, flac). Default: wav
-    - stems: Comma-separated stems to extract (default: all). Options: vocals,drums,bass,other,guitar,piano
-    
-    Returns:
-    - job_id: Use to check status and download results
-    """
-    
-    output_format = format.lower()
-    if output_format not in SUPPORTED_OUTPUT_FORMATS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported format. Supported: {', '.join(SUPPORTED_OUTPUT_FORMATS)}"
-        )
-    
-    stems_list = None
-    if stems:
-        stems_list = [s.strip().lower() for s in stems.split(',')]
-        invalid_stems = [s for s in stems_list if s not in STEMS]
-        if invalid_stems:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid stems: {invalid_stems}. Available: {', '.join(STEMS)}"
-            )
-    
-    ext = Path(file.filename).suffix.lower()
-    if ext not in SUPPORTED_INPUT_FORMATS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported format. Supported: {', '.join(SUPPORTED_INPUT_FORMATS)}"
-        )
-    
-    job_id = str(uuid.uuid4())[:8]
-    input_path = UPLOAD_DIR / f"{job_id}{ext}"
-    
-    try:
-        content = await file.read()
-        if len(content) > MAX_FILE_SIZE_MB * 1024 * 1024:
-            raise HTTPException(
-                status_code=413,
-                detail=f"File too large. Max size: {MAX_FILE_SIZE_MB}MB"
-            )
-        
-        with open(input_path, 'wb') as f:
-            f.write(content)
-        
-        jobs[job_id] = {
-            "status": "processing",
-            "filename": file.filename,
-            "output_format": output_format,
-            "stems": stems_list if stems_list else "all",
-            "started": asyncio.get_event_loop().time()
-        }
-        
-        result = await run_in_threadpool(
-            separate_audio_all,
-            str(input_path),
-            OUTPUT_DIR,
-            job_id,
-            output_format,
-            stems_list
-        )
-        
-        jobs[job_id].update(result)
-        
-        return {
-            "job_id": job_id,
-            "status": "processing",
-            "output_format": output_format,
-            "stems": stems_list if stems_list else "all"
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        jobs[job_id] = {"status": "error", "error": str(e)}
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/status/{job_id}")
-async def get_status(job_id: str):
-    """Get job status"""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[job_id]
-    response = {"job_id": job_id, "status": job["status"]}
-    
-    if "error" in job:
-        response["error"] = job["error"]
-    
-    if "stems" in job:
-        response["stems"] = job["stems"]
-    
-    if "total_output_size_mb" in job:
-        response["total_output_size_mb"] = job["total_output_size_mb"]
-    
-    if "output_format" in job:
-        response["output_format"] = job["output_format"]
-    
-    if "processing_time_seconds" in job:
-        response["processing_time_seconds"] = job["processing_time_seconds"]
-    
-    return response
-
-
-@app.get("/download/{job_id}")
-async def download_result(job_id: str, stem: str = None):
-    """Download extracted stems
-    
-    Parameters:
-    - job_id: Job ID
-    - stem: Specific stem to download (vocals, drums, bass, other, guitar, piano). If not provided, returns zip of all stems.
-    
-    Returns:
-    - Audio file (single stem) or ZIP file (all stems)
-    """
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[job_id]
-    if job["status"] != "completed":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Job status: {job['status']}"
-        )
-    
-    output_format = job.get("output_format", "wav")
-    media_types = {
-        'wav': 'audio/wav',
-        'mp3': 'audio/mpeg',
-        'ogg': 'audio/ogg',
-        'flac': 'audio/flac'
-    }
-    
-    filename_base = job.get("filename", "audio")
-    if "title" in job:
-        filename_base = job["title"]
-    
-    # If stem specified, return single stem
-    if stem:
-        stem = stem.lower()
-        if stem not in STEMS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid stem. Available: {', '.join(STEMS)}"
-            )
-        
-        stem_path = OUTPUT_DIR / f"{job_id}_{stem}.{output_format}"
-        if not stem_path.exists():
-            raise HTTPException(status_code=404, detail=f"Stem '{stem}' not found")
-        
-        return FileResponse(
-            stem_path,
-            media_type=media_types.get(output_format, "audio/wav"),
-            filename=f"{Path(filename_base).stem}_{stem}.{output_format}"
-        )
-    
-    # Return zip of all stems
-    zip_path = OUTPUT_DIR / f"{job_id}_all.zip"
-    if not zip_path.exists():
-        raise HTTPException(status_code=404, detail="Zip file not found")
-    
-    return FileResponse(
-        zip_path,
-        media_type="application/zip",
-        filename=f"{Path(filename_base).stem}_stems.zip"
+    model_dir = Path(model_dir)
+    checkpoint = torch.load(
+        model_dir / "model.pth",
+        map_location="cpu",
+        weights_only=True,
     )
+    
+    model = create_model(checkpoint["model_type"], checkpoint["model_size"])
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    
+    # Trace with sample input
+    sample_rate = checkpoint.get("sample_rate", 44100)
+    sample_input = torch.randn(1, 1, sample_rate * 2)  # 2 seconds of audio
+    
+    traced = torch.jit.trace(model, sample_input)
+    
+    # Convert to CoreML
+    mlmodel = ct.convert(
+        traced,
+        inputs=[ct.TensorType(name="input", shape=sample_input.shape, dtype=np.float32)],
+        outputs=[ct.TensorType(name="output", dtype=np.float32)],
+        minimum_deployment_target=ct.target.macOS14,
+        convert_to="mlprogram",
+    )
+    
+    # Save
+    coreml_path = model_dir / "model.mlpackage"
+    mlmodel.save(str(coreml_path))
+    
+    # Update metadata
+    metadata = {}
+    meta_path = model_dir / "metadata.json"
+    if meta_path.exists():
+        with open(meta_path) as f:
+            metadata = json.load(f)
+    metadata["coreml_path"] = str(coreml_path)
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    
+    return coreml_path
 
-
-@app.get("/stems/{job_id}")
-async def list_stems(job_id: str):
-    """List available stems for a completed job"""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[job_id]
-    if job["status"] != "completed":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Job status: {job['status']}"
-        )
-    
-    if "stems" not in job:
-        raise HTTPException(status_code=400, detail="No stems found for this job")
-    
-    available = {}
-    for stem_name, stem_info in job["stems"].items():
-        available[stem_name] = {
-            "size_mb": stem_info["size_mb"],
-            "download_url": f"/download/{job_id}?stem={stem_name}"
-        }
-    
-    return {
-        "job_id": job_id,
-        "stems": available,
-        "zip_url": f"/download/{job_id}"
-    }
-
+# ============================================================
+# Main
+# ============================================================
 
 if __name__ == "__main__":
     import uvicorn
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Stem Separation API v3")
-    parser.add_argument("--port", type=int, default=8766, help="Port to run server on")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind to")
-    args = parser.parse_args()
-    
-    logger.info(f"Starting Stem Separation API v3 on {args.host}:{args.port}")
-    logger.info("Apple Silicon optimization: MLX enabled when available")
-    logger.info(f"Available stems: {', '.join(STEMS)}")
-    uvicorn.run(app, host=args.host, port=args.port)
+    print("🎸 Tone Replicator API v2.0 starting on http://localhost:8767")
+    print("   Endpoints: /pipeline (URL→tone), /train, /apply, /models")
+    uvicorn.run(app, host="0.0.0.0", port=8767)

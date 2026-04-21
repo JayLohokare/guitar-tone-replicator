@@ -1,15 +1,34 @@
 #!/bin/bash
-# Guitar Separation API v2 - Start Script
+# Tone Replicator - Start everything
+# Usage: ./start.sh
 
-cd ~/guitar-api-v2
+set -e
 
-# Activate virtual environment if it exists
-if [ -d "venv" ]; then
-    source venv/bin/activate
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# Start the Python API server
+echo "🎸 Starting Tone Replicator API server..."
+source venv/bin/activate
+python server.py &
+SERVER_PID=$!
+
+echo "✅ API server running on http://localhost:8767 (PID: $SERVER_PID)"
+
+# Start the Mac app
+echo "🎸 Launching Tone Replicator app..."
+if [ -f "ToneReplicatorApp/.build/release/ToneReplicatorApp" ]; then
+    open ToneReplicatorApp/.build/release/ToneReplicatorApp
+else
+    echo "Building Mac app first..."
+    cd ToneReplicatorApp && swift build -c release && cd ..
+    open ToneReplicatorApp/.build/release/ToneReplicatorApp
 fi
 
-# Set environment variables
-export PYTORCH_ENABLE_MPS_FALLBACK=1
+echo ""
+echo "🎸 Tone Replicator is running!"
+echo "   API: http://localhost:8767"
+echo "   Press Ctrl+C to stop the server"
 
-# Run server on port 8766 (v2)
-python3 server.py --port 8766
+# Wait for server
+wait $SERVER_PID

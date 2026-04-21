@@ -1,32 +1,18 @@
-# Python
+.build/
+*.dSYM/
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
+*.pyc
 venv/
-env/
-.venv/
-
-# Uploads and outputs
-uploads/
-outputs/
-
-# Logs
-*.log
-tunnel_output.log
-server.log
-
-# OS
+models/
+*.wav
+*.mp3
+neural-amp-modeler/
+tonetwist-afx-dataset/
+*.mlpackage/
+*.onnx
+*.pth
+*.app/
 .DS_Store
-Thumbs.db
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# Environment
-.env
-.env.local
+ToneReplicatorApp/.build/arm64-apple-macosx/
+ToneReplicatorApp/.build/debug/
+ToneReplicatorApp/.build/release/ToneReplicatorApp.app/
